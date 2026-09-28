@@ -1,118 +1,191 @@
+"""
+Streamlit Inventory Management App
+Features:
+  - KPI metric cards
+  - Plotly gauge charts per product
+  - Reorder alerts table with CSV export
+  - Supply distribution bar + pie charts
+"""
+
+import io
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
 import streamlit as st
 
-# Set Streamlit page configuration
+# ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Raw Material Procurement Forecaster",
+    page_title="Inventory Dashboard",
     page_icon="📦",
     layout="wide",
 )
 
-st.title("📦 Raw Material Procurement Forecaster")
-st.markdown(
-    "Real-time supply chain inventory forecasting and reorder alert system."
-)
-
-
-# Generate Mock Inventory Data
+# ── Data layer ─────────────────────────────────────────────────────────────────
 @st.cache_data
-def load_data():
-    data = {
-        "item_id": [
-            "RM-001",
-            "RM-002",
-            "RM-003",
-            "RM-004",
-            "RM-005",
-            "RM-006",
-            "RM-007",
-            "RM-008",
-            "RM-009",
-            "RM-010",
-        ],
-        "item_name": [
-            "Whole Milk (L)",
-            "Espresso Beans (kg)",
-            "Oat Milk (L)",
-            "Vanilla Syrup (L)",
-            "Paper Cups (12oz)",
-            "Coffee Filters",
-            "Sugar Bags (kg)",
-            "Matcha Powder (kg)",
-            "Napkins (pack)",
-            "Chocolate Sauce (L)",
-        ],
-        "stock_level": [50.0, 12.0, 8.0, 25.0, 1500.0, 0.0, 45.0, 2.0, 300.0, 15.0],
-        "avg_daily_usage": [
-            15.0,
-            2.5,
-            4.0,
-            1.2,
-            200.0,
-            0.0,
-            3.0,
-            0.5,
-            50.0,
-            1.0,
-        ],
-        "lead_time_days": [3, 5, 3, 7, 4, 2, 6, 10, 3, 5],
-    }
-    return pd.DataFrame(data)
+def load_data(uploaded_file=None) -> pd.DataFrame:
+    """Return inventory DataFrame from upload or built-in sample."""
+    if uploaded_file is not None:
+        return pd.read_csv(uploaded_file)
 
-
-df = load_data().copy()
-
-# Safe calculation of 'Days of Stock Remaining' to handle zero division
-df["days_remaining"] = df.apply(
-    lambda row: round(row["stock_level"] / row["avg_daily_usage"], 1)
-    if row["avg_daily_usage"] > 0
-    else (0.0 if row["stock_level"] == 0 else float("inf")),
-    axis=1,
-)
-
-# Flag items requiring immediate reorder (days remaining < lead time)
-df["reorder_required"] = df["days_remaining"] < df["lead_time_days"]
-
-# Summary Metrics
-total_items = len(df)
-reorder_count = int(df["reorder_required"].sum())
-out_of_stock_count = int((df["stock_level"] == 0).sum())
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Tracked Items", total_items)
-col2.metric(
-    "Reorder Alerts", reorder_count, delta_color="inverse"
-)
-col3.metric("Out of Stock", out_of_stock_count, delta_color="inverse")
-
-st.markdown("---")
-st.subheader("Inventory Status Matrix")
-
-
-# Styling function to highlight rows requiring reorder
-def highlight_reorder(row):
-    if row["reorder_required"]:
-        return ["background-color: #ffcccc; color: #900c3f; font-weight: bold;"] * len(
-            row
-        )
-    return [""] * len(row)
-
-
-# Display styled DataFrame
-styled_df = df.style.apply(highlight_reorder, axis=1).format(
-    {"stock_level": "{:.1f}", "avg_daily_usage": "{:.1f}", "days_remaining": "{}"}
-)
-
-st.dataframe(styled_df, use_container_width=True)
-
-# Alerts Section
-if reorder_count > 0:
-    st.error(
-        f"🚨 **Attention Required:** {reorder_count} item(s) are below their reorder lead time threshold!"
+    # Sample data — replace with your real source
+    return pd.DataFrame(
+        {
+            "Product":     ["Widget A", "Widget B", "Gadget X", "Gadget Y",
+                            "Part Z",   "Part W",   "Tool M",   "Tool N"],
+            "Category":    ["Widgets", "Widgets", "Gadgets", "Gadgets",
+                            "Parts",   "Parts",   "Tools",   "Tools"],
+            "Stock":       [120, 8, 0, 45, 15, 200, 3, 60],
+            "Reorder_At":  [50, 20, 10, 30, 25, 100, 10, 40],
+            "Unit_Price":  [9.99, 14.99, 29.99, 24.99, 4.99, 2.49, 39.99, 19.99],
+        }
     )
-    reorder_items = df[df["reorder_required"]][
-        ["item_id", "item_name", "stock_level", "days_remaining", "lead_time_days"]
-    ]
-    st.table(reorder_items)
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serialize a DataFrame to UTF-8 CSV bytes."""
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Controls")
+    uploaded = st.file_uploader("Upload CSV", type="csv")
+    df = load_data(uploaded)
+
+    categories = ["All"] + sorted(df["Category"].unique().tolist())
+    selected_cat = st.selectbox("Category", categories)
+
+    threshold = st.slider(
+        "Reorder threshold override",
+        min_value=0,
+        max_value=int(df["Stock"].max()),
+        value=0,
+        help="0 = use each product's own Reorder_At value",
+    )
+
+st.title("📦 Inventory Dashboard")
+st.caption("Real-time stock health, reorder alerts, and supply distribution.")
+
+# ── Apply filters ──────────────────────────────────────────────────────────────
+filtered = df.copy() if selected_cat == "All" else df[df["Category"] == selected_cat].copy()
+
+# Effective reorder point: use override if > 0
+filtered["Effective_Reorder"] = filtered["Reorder_At"].where(threshold == 0, threshold)
+filtered["Status"] = pd.cut(
+    filtered["Stock"],
+    bins=[-1, 0, filtered["Effective_Reorder"].max(), float("inf")],
+    labels=["Out of Stock", "Low Stock", "OK"],
+)
+
+alerts = filtered[filtered["Stock"] <= filtered["Effective_Reorder"]].copy()
+
+# ── KPI row ────────────────────────────────────────────────────────────────────
+total_products  = len(filtered)
+low_stock_count = int((filtered["Stock"] < filtered["Effective_Reorder"]).sum())
+out_of_stock    = int((filtered["Stock"] == 0).sum())
+total_value     = (filtered["Stock"] * filtered["Unit_Price"]).sum()
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total Products",  total_products)
+k2.metric("⚠️ Low Stock",    low_stock_count, delta=f"-{low_stock_count}" if low_stock_count else None, delta_color="inverse")
+k3.metric("🚨 Out of Stock", out_of_stock,    delta=f"-{out_of_stock}"    if out_of_stock    else None, delta_color="inverse")
+k4.metric("💰 Stock Value",  f"${total_value:,.2f}")
+
+st.divider()
+
+# ── Gauge charts ───────────────────────────────────────────────────────────────
+st.subheader("📊 Stock Level Gauges")
+st.caption("Each gauge shows current stock relative to its reorder point (red) and a healthy buffer (green).")
+
+gauge_items = filtered.head(6)          # cap at 6 to keep the row readable
+cols = st.columns(len(gauge_items))
+
+for col, (_, row) in zip(cols, gauge_items.iterrows()):
+    healthy = int(row["Effective_Reorder"] * 2)
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=row["Stock"],
+            title={"text": row["Product"], "font": {"size": 13}},
+            gauge={
+                "axis":  {"range": [0, max(healthy, row["Stock"] + 10)]},
+                "bar":   {"color": "#1f77b4"},
+                "steps": [
+                    {"range": [0,                     row["Effective_Reorder"]], "color": "#ff4b4b"},
+                    {"range": [row["Effective_Reorder"], healthy],               "color": "#ffa500"},
+                    {"range": [healthy,               max(healthy, row["Stock"] + 10)], "color": "#2ca02c"},
+                ],
+                "threshold": {
+                    "line":  {"color": "red", "width": 3},
+                    "thickness": 0.75,
+                    "value": row["Effective_Reorder"],
+                },
+            },
+        )
+    )
+    fig.update_layout(height=220, margin=dict(t=40, b=10, l=10, r=10))
+    col.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# ── Reorder alerts + CSV export ────────────────────────────────────────────────
+st.subheader("🚨 Reorder Alerts")
+
+if alerts.empty:
+    st.success("All products are above their reorder points. ✅")
 else:
-    st.success("✅ All inventory levels are within safe operating margins.")
+    st.warning(f"{len(alerts)} product(s) need restocking.")
+
+    display_cols = ["Product", "Category", "Stock", "Reorder_At", "Unit_Price"]
+    st.dataframe(
+        alerts[display_cols].style.applymap(
+            lambda v: "background-color: #ff4b4b; color: white;" if v == 0 else "",
+            subset=["Stock"],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        label="⬇️ Download Reorder Alerts as CSV",
+        data=to_csv_bytes(alerts[display_cols]),
+        file_name="reorder_alerts.csv",
+        mime="text/csv",
+        type="primary",
+    )
+
+st.divider()
+
+# ── Supply distribution ────────────────────────────────────────────────────────
+st.subheader("📦 Supply Distribution")
+
+chart_col, pie_col = st.columns([2, 1])
+
+with chart_col:
+    bar_fig = px.bar(
+        filtered.sort_values("Stock"),
+        x="Product",
+        y="Stock",
+        color="Category",
+        text="Stock",
+        title="Stock by Product",
+        labels={"Stock": "Units in Stock"},
+    )
+    bar_fig.update_traces(textposition="outside")
+    bar_fig.update_layout(xaxis_tickangle=-35, height=380)
+    st.plotly_chart(bar_fig, use_container_width=True)
+
+with pie_col:
+    cat_totals = filtered.groupby("Category", as_index=False)["Stock"].sum()
+    pie_fig = px.pie(
+        cat_totals,
+        names="Category",
+        values="Stock",
+        title="Stock Share by Category",
+        hole=0.4,
+    )
+    pie_fig.update_traces(textposition="inside", textinfo="percent+label")
+    pie_fig.update_layout(height=380, showlegend=False)
+    st.plotly_chart(pie_fig, use_container_width=True)
